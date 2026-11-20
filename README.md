@@ -1,13 +1,12 @@
 # backend-realtime
 
-Servicio independiente de Node.js, TypeScript y Socket.IO. Comparte el proyecto
-Firebase y la base de Firestore con `backend-api`; no crea una colección
-alternativa de salas ni modifica el esquema de US-06.
+Servicio independiente Node.js + TypeScript + Socket.IO. Comparte el mismo
+proyecto Firebase/Firestore que `backend-api`; no crea una colección alternativa
+de salas ni cambia los documentos existentes de US-06.
 
 ## Modelo de Firestore
 
-`backend-api` es el dueño de la creación de salas. Los documentos existentes
-permanecen en `rooms/{roomId}` con el esquema:
+Las salas existentes viven en `rooms/{roomId}`:
 
 ```text
 rooms/{roomId}
@@ -16,68 +15,108 @@ rooms/{roomId}
   createdAt: Timestamp
 ```
 
-El ID de la sala es el ID del documento. Los mensajes se modelan como
-subcolección de la sala, no como una colección global:
+Los mensajes se guardan en la subcolección de cada sala:
 
 ```text
 rooms/{roomId}/messages/{messageId}
-  senderUid: string
+  senderUid: string | null
   senderName: string
   content: string
   createdAt: Timestamp
 ```
 
-`senderName` es una instantánea del nombre mostrado al enviar el mensaje. La
-política de eliminación de cuenta requiere conservar los mensajes de salas
-ajenas y anonimizar su autor; cuando se implemente persistencia de mensajes,
-esa limpieza deberá anonimizar tanto `senderName` como `senderUid`. Esta fase
-solo define y documenta el modelo: todavía no persiste, distribuye ni consulta
-mensajes.
+En un mensaje nuevo `senderUid` contiene el UID verificado del socket. Al
+eliminar una cuenta, `backend-api` conserva los mensajes de salas ajenas, pero
+establece `senderUid` en `null` y `senderName` en `Usuario eliminado`. Las salas
+propias y sus descendientes se eliminan recursivamente. Las escrituras de chat
+comprueban el marcador de eliminación de cuenta en la misma transacción que
+crea el mensaje.
 
-No se amplía el documento de sala con participantes o presencia en esta fase.
-La presencia es temporal y se podrá modelar después; los miembros persistentes
-deberán definirse cuando se implemente la autorización para colaboración.
+## Acceso a salas y presencia
 
-## Estructura
+La política aprobada para esta fase es que el ID de sala funciona como una
+invitación: cualquier usuario autenticado que conozca el ID puede entrar. Se
+consulta `rooms/{roomId}` antes de aceptar el ingreso. El esquema actual no
+guarda participantes ni roles.
 
-- `src/server.ts`: servidor HTTP, endpoint de salud y montaje de Socket.IO.
-- `src/config`: configuración de entorno y Firebase Admin.
-- `src/middlewares/socketAuth.ts`: verifica el ID token Firebase al conectar.
-- `src/sockets`: configuración de Socket.IO; no contiene eventos de chat aún.
-- `src/repositories/rooms.repository.ts`: lectura del documento de sala
-  existente en `rooms`.
-- `src/types`: tipos de sala, mensaje y datos autenticados del socket.
+La presencia se mantiene en memoria por instancia y por sala, contando sockets
+activos por UID. Un usuario con varias conexiones permanece online hasta que
+sale su último socket de esa sala. Al desconectarse un socket, sus membresías se
+limpian automáticamente.
+
+Esta estrategia funciona con una sola instancia. Si Render ejecuta varias
+instancias, cada una tendría su propia presencia y sus propias salas Socket.IO;
+los eventos no cruzarían instancias. Para escalar horizontalmente se requiere
+un adaptador compartido (por ejemplo, Socket.IO Redis Adapter) y una estrategia
+compartida de presencia. Firestore no se usa como almacén de presencia en esta
+fase.
+
+## Eventos Socket.IO
+
+La autenticación se envía al conectar:
+
+```ts
+io(url, { auth: { token: firebaseIdToken } });
+```
+
+| Evento | Dirección | Payload / respuesta | Errores |
+|---|---|---|---|
+| `connection` | cliente → servidor (handshake; aceptación del servidor) | Conexión aceptada tras verificar el token. | `connect_error`: `AUTH_REQUIRED`, `INVALID_TOKEN` o `AUTH_UNAVAILABLE`. |
+| `room:join` | cliente → servidor | `{ roomId }`. | `room:error`: `INVALID_ROOM_ID`, `ROOM_NOT_FOUND`, `ROOM_LOOKUP_FAILED` o `ROOM_JOIN_FAILED`. |
+| `room:joined` | servidor → cliente | `{ roomId, roomName, onlineUsers: [{ uid, displayName }] }`. | Se emite solo después de comprobar y unir el socket a la sala. |
+| `room:leave` | cliente → servidor | `{ roomId }`. | `room:error`: `INVALID_ROOM_ID`, `NOT_IN_ROOM` o `ROOM_LEAVE_FAILED`. |
+| `room:left` | servidor → cliente | `{ roomId }` tras retirar el socket. | No se emite si la solicitud de salida es inválida. |
+| `room:error` | servidor → cliente | `{ roomId?, code, message }`. | Respuesta de error a operaciones de sala o mensaje. |
+| `message:send` | cliente → servidor | `{ roomId, content }`; máximo 2000 caracteres. Campos como `senderUid` del cliente se ignoran. | `room:error`: `INVALID_ROOM_ID`, `NOT_IN_ROOM`, `INVALID_CONTENT`, `ROOM_NOT_FOUND`, `ACCOUNT_DELETION_IN_PROGRESS` o `MESSAGE_PERSISTENCE_FAILED`. |
+| `message:new` | servidor → miembros de la sala | `{ id, roomId, senderUid, senderName, content, createdAt }`. Se emite después de guardar en Firestore. | Si falla el guardado, no se emite. |
+| `presence:update` | servidor → otros miembros de la sala | `{ roomId, uid, displayName, status: "online" \| "offline" }`. Solo cambia al conectarse el primer socket o desconectarse el último del usuario en esa sala. | No se emite por una desconexión individual si quedan otros sockets activos. |
+| `disconnect` | cliente o servidor → contraparte | Evento Socket.IO sin payload; el servidor limpia la presencia de ese socket. | No aplica. |
+
+El servidor obtiene la identidad exclusivamente de `verifyIdToken` durante el
+handshake. No acepta UID del payload para unirse o enviar mensajes.
 
 ## Variables de entorno
 
-Copiar `.env.example` como `.env` y configurar:
+Copiar `.env.example` a `.env` para desarrollo local:
 
-- `PORT`: puerto HTTP/Socket.IO (por defecto `3001`).
+- `PORT`: puerto HTTP/Socket.IO (por defecto `3001`; Render asigna `PORT`).
 - `CORS_ORIGINS`: orígenes frontend separados por coma.
-- `FIREBASE_SERVICE_ACCOUNT_JSON`: JSON completo de la cuenta de servicio
-  Firebase. La cuenta debe apuntar al mismo proyecto configurado en
-  `backend-api`.
+- `FIREBASE_SERVICE_ACCOUNT_JSON`: JSON completo de la cuenta de servicio del
+  mismo proyecto que usa `backend-api`.
 
-No guardar credenciales reales en el repositorio. Cada servicio es un proceso
-independiente y debe inicializar Firebase Admin en su propio proceso; ambos usan
-las mismas credenciales/proyecto y las mismas rutas de Firestore.
+No agregar `.env` ni credenciales al repositorio o a la imagen Docker.
 
-## Desarrollo
+## Desarrollo y pruebas
 
 ```bash
 npm install
 cp .env.example .env
-# Completar FIREBASE_SERVICE_ACCOUNT_JSON en .env
+# Completar FIREBASE_SERVICE_ACCOUNT_JSON localmente
 npm run dev
+npm test
+npm run build
 ```
 
-El endpoint `GET /health` comprueba que el servicio está activo. La conexión
-Socket.IO requiere un ID token Firebase en el campo `auth.token` del handshake.
-Todavía no existen eventos para unirse a salas ni enviar mensajes.
+Las pruebas usan dependencias simuladas y no escriben en Firestore real.
+`GET /health` devuelve `{"estado":"ok"}`.
 
-## Build
+## Docker y Render
+
+Construir y ejecutar localmente:
 
 ```bash
-npm run build
-npm start
+docker build -t backend-realtime .
+docker run --rm -p 3001:3001 \
+  -e PORT=3001 \
+  -e CORS_ORIGINS=http://localhost:5173 \
+  -e FIREBASE_SERVICE_ACCOUNT_JSON \
+  backend-realtime
 ```
+
+En Render, crear un servicio de tipo **Web Service** con runtime **Docker** y
+configurar la raíz del servicio como `backend-realtime` (o indicar
+`backend-realtime/Dockerfile` si la raíz es el repositorio). Configurar
+`FIREBASE_SERVICE_ACCOUNT_JSON` y `CORS_ORIGINS` en el panel de variables
+secretas; Render proporciona `PORT`. Usar `/health` como health check.
+Mantener una instancia mientras no se configure un adaptador distribuido para
+Socket.IO.
