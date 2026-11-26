@@ -1,6 +1,6 @@
 import { Timestamp } from "firebase-admin/firestore";
 import { obtenerFirestore } from "../config/firebase";
-import { SalaDocumento } from "../types/room";
+import { ObservarSala, SalaDocumento } from "../types/room";
 
 const ROOMS = "rooms";
 
@@ -12,7 +12,7 @@ export async function obtenerSala(
   roomId: string,
 ): Promise<SalaPersistida | null> {
   const snapshot = await obtenerFirestore().collection(ROOMS).doc(roomId).get();
-  if (!snapshot.exists) return null;
+  if (!snapshot.exists || snapshot.get("closingAt") !== undefined) return null;
 
   const documento = snapshot.data();
   if (
@@ -31,3 +31,9 @@ export async function obtenerSala(
     createdAt: documento.createdAt,
   };
 }
+
+export const observarSala: ObservarSala = (roomId, alCambiar, alFallar) =>
+  obtenerFirestore().collection(ROOMS).doc(roomId).onSnapshot(
+    (snapshot) => alCambiar(snapshot.exists && snapshot.get("closingAt") === undefined),
+    alFallar,
+  );

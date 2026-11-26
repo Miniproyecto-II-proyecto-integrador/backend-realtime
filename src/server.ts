@@ -1,7 +1,7 @@
 import { inicializarFirebaseAdmin, obtenerAuth } from "./config/firebase";
 import { env } from "./config/env";
 import { guardarMensaje } from "./repositories/messages.repository";
-import { obtenerSala } from "./repositories/rooms.repository";
+import { observarSala, obtenerSala } from "./repositories/rooms.repository";
 import { crearServidorRealtime } from "./app";
 
 inicializarFirebaseAdmin();
@@ -13,6 +13,7 @@ const { httpServer } = crearServidorRealtime(
       return { uid, name };
     },
     getRoom: obtenerSala,
+    watchRoom: observarSala,
     saveMessage: ({ roomId, ...mensaje }) => guardarMensaje(roomId, mensaje),
   },
   env.corsOrigins,

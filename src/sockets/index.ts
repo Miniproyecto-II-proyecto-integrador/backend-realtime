@@ -1,6 +1,7 @@
 import { Server, Socket } from "socket.io";
 import { crearMiddlewareSocketAuth } from "../middlewares/socketAuth";
 import { PresenceTracker } from "../services/presence.service";
+import { SalaVigilada, VigilanciaSalas } from "../services/room-watch.service";
 import {
   ClientToServerEvents,
   InterServerEvents,
@@ -8,18 +9,30 @@ import {
 } from "../types/events";
 import {
   EliminacionCuentaEnCursoError,
+  PerfilEmisorNoEncontradoError,
   SalaNoEncontradaError,
 } from "../types/domainErrors";
 import { MensajePersistido } from "../types/message";
+import { ObservarSala } from "../types/room";
 
 const MAX_ROOM_ID_LENGTH = 128;
 const MAX_MESSAGE_LENGTH = 2000;
+const MAX_ADMISIONES_PENDIENTES = 8;
+const PLAZO_ADMISION_MS = 5_000;
+
+interface AdmisionPendiente {
+  signal: AbortSignal;
+  consultaCancelada: Promise<undefined>;
+  enAdaptador: boolean;
+  cancelar(): void;
+}
 
 export interface RealtimeDependencies {
   verifyIdToken: (token: string) => Promise<{ uid: string; name?: string }>;
   getRoom: (
     roomId: string,
   ) => Promise<{ id: string; nombre: string; ownerUid: string } | null>;
+  watchRoom: ObservarSala;
   saveMessage: (input: {
     roomId: string;
     senderUid: string;
@@ -70,48 +83,56 @@ function emitirError(
 
 async function ingresarSala(
   socket: RealtimeSocket,
-  payload: unknown,
+  roomId: string,
   dependencies: RealtimeDependencies,
   presence: PresenceTracker,
+  vigilancia: VigilanciaSalas,
+  sala: SalaVigilada,
+  admision: AdmisionPendiente,
 ): Promise<void> {
-  const roomId = leerRoomId(payload);
-  if (!roomId) {
-    emitirError(socket, "INVALID_ROOM_ID", "El ID de sala no es válido.");
-    return;
-  }
-
-  let room: Awaited<ReturnType<RealtimeDependencies["getRoom"]>>;
   try {
-    room = await dependencies.getRoom(roomId);
-  } catch (error) {
-    console.error("[Socket.IO] error consultando sala:", error);
-    emitirError(
-      socket,
-      "ROOM_LOOKUP_FAILED",
-      "No se pudo verificar la sala.",
-      roomId,
-    );
-    return;
-  }
+    let room: Awaited<ReturnType<RealtimeDependencies["getRoom"]>> | undefined;
+    try {
+      room = sala.cerrada ? null : await Promise.race([
+        dependencies.getRoom(roomId),
+        admision.consultaCancelada,
+      ]);
+    } catch (error) {
+      if (admision.signal.aborted) return;
+      if (sala.cerrada) {
+        emitirError(socket, "ROOM_NOT_FOUND", "La sala no existe.", roomId);
+        return;
+      }
+      console.error("[Socket.IO] error consultando sala:", error);
+      emitirError(socket, "ROOM_LOOKUP_FAILED", "No se pudo verificar la sala.", roomId);
+      return;
+    }
+    if (admision.signal.aborted) return;
+    if (!room) vigilancia.cerrar(roomId, sala);
+    if (!room || sala.cerrada) {
+      emitirError(socket, "ROOM_NOT_FOUND", "La sala no existe.", roomId);
+      return;
+    }
 
-  if (!room) {
-    emitirError(socket, "ROOM_NOT_FOUND", "La sala no existe.", roomId);
-    return;
-  }
-
-  if (socket.rooms.has(roomId)) {
-    socket.emit("room:joined", {
-      roomId,
-      roomName: room.nombre,
-      onlineUsers: presence.usuariosEnSala(roomId),
-    });
-    return;
-  }
-
-  if (!socket.connected) return;
-  try {
-    await socket.join(roomId);
     if (!socket.connected) return;
+    if (presence.tieneConexion(roomId, socket.id, socket.data.uid)) {
+      socket.emit("room:joined", {
+        roomId,
+        roomName: room.nombre,
+        onlineUsers: presence.usuariosEnSala(roomId),
+      });
+      return;
+    }
+
+    admision.enAdaptador = true;
+    await socket.join(roomId);
+    if (!socket.connected || admision.signal.aborted || sala.cerrada) {
+      await socket.leave(roomId);
+      if (socket.connected && !admision.signal.aborted) {
+        emitirError(socket, "ROOM_NOT_FOUND", "La sala no existe.", roomId);
+      }
+      return;
+    }
     const identity = {
       uid: socket.data.uid,
       displayName: socket.data.displayName ?? "Usuario",
@@ -130,6 +151,11 @@ async function ingresarSala(
       });
     }
   } catch (error) {
+    if (admision.signal.aborted) return;
+    if (sala.cerrada) {
+      emitirError(socket, "ROOM_NOT_FOUND", "La sala no existe.", roomId);
+      return;
+    }
     console.error("[Socket.IO] error ingresando a sala:", error);
     emitirError(
       socket,
@@ -145,13 +171,15 @@ async function salirSala(
   payload: unknown,
   presence: PresenceTracker,
   io: RealtimeServer,
+  vigilancia: VigilanciaSalas,
 ): Promise<void> {
   const roomId = leerRoomId(payload);
   if (!roomId) {
     emitirError(socket, "INVALID_ROOM_ID", "El ID de sala no es válido.");
     return;
   }
-  if (!presence.tieneConexion(roomId, socket.id, socket.data.uid)) {
+  const sala = vigilancia.obtener(roomId);
+  if (!sala || !presence.tieneConexion(roomId, socket.id, socket.data.uid)) {
     emitirError(
       socket,
       "NOT_IN_ROOM",
@@ -164,6 +192,7 @@ async function salirSala(
   try {
     await socket.leave(roomId);
   } catch (error) {
+    if (sala.cerrada) return;
     console.error("[Socket.IO] error saliendo de sala:", error);
     emitirError(
       socket,
@@ -175,6 +204,7 @@ async function salirSala(
   }
 
   const salida = presence.quitar(roomId, socket.id);
+  vigilancia.liberarSiVacia(roomId);
   socket.emit("room:left", { roomId });
   if (salida?.quedoOffline) {
     io.to(roomId).emit("presence:update", {
@@ -191,6 +221,7 @@ async function enviarMensaje(
   dependencies: RealtimeDependencies,
   presence: PresenceTracker,
   io: RealtimeServer,
+  vigilancia: VigilanciaSalas,
 ): Promise<void> {
   const data = leerObjeto(payload);
   const roomId = leerRoomId(data);
@@ -198,7 +229,8 @@ async function enviarMensaje(
     emitirError(socket, "INVALID_ROOM_ID", "El ID de sala no es válido.");
     return;
   }
-  if (!presence.tieneConexion(roomId, socket.id, socket.data.uid)) {
+  const sala = vigilancia.obtener(roomId);
+  if (!sala || !presence.tieneConexion(roomId, socket.id, socket.data.uid)) {
     emitirError(
       socket,
       "NOT_IN_ROOM",
@@ -220,16 +252,19 @@ async function enviarMensaje(
     return;
   }
 
-  let message: MensajePersistido;
+  const { liberar } = vigilancia.retener(roomId);
   try {
-    message = await dependencies.saveMessage({
+    const message = await dependencies.saveMessage({
       roomId,
       senderUid: socket.data.uid,
       senderName: socket.data.displayName?.trim() || "Usuario",
       content,
     });
+    if (!sala.cerrada) io.to(roomId).emit("message:new", message);
   } catch (error) {
+    if (sala.cerrada) return;
     if (error instanceof SalaNoEncontradaError) {
+      vigilancia.cerrar(roomId, sala);
       emitirError(socket, "ROOM_NOT_FOUND", error.message, roomId);
       return;
     }
@@ -242,6 +277,10 @@ async function enviarMensaje(
       );
       return;
     }
+    if (error instanceof PerfilEmisorNoEncontradoError) {
+      emitirError(socket, "ACCOUNT_NOT_AVAILABLE", error.message, roomId);
+      return;
+    }
     console.error("[Socket.IO] no se pudo persistir el mensaje:", error);
     emitirError(
       socket,
@@ -249,10 +288,9 @@ async function enviarMensaje(
       "No se pudo guardar el mensaje.",
       roomId,
     );
-    return;
+  } finally {
+    liberar();
   }
-
-  io.to(roomId).emit("message:new", message);
 }
 
 export function configurarSockets(
@@ -260,20 +298,82 @@ export function configurarSockets(
   dependencies: RealtimeDependencies,
   presence: PresenceTracker,
 ): void {
+  const vigilancia = new VigilanciaSalas(
+    dependencies.watchRoom,
+    (roomId) => presence.tieneUsuarios(roomId),
+    (roomId) => {
+      for (const socketId of presence.quitarSala(roomId)) {
+        const socket = io.sockets.sockets.get(socketId);
+        if (socket?.rooms.has(roomId)) socket.emit("room:deleted", { roomId });
+      }
+      io.in(roomId).socketsLeave(roomId);
+    },
+  );
   io.use(crearMiddlewareSocketAuth(dependencies.verifyIdToken));
 
   io.on("connection", (socket) => {
+    const pendientes = new Map<string, AdmisionPendiente>();
     socket.on("room:join", (payload) => {
-      void ingresarSala(socket, payload, dependencies, presence);
+      const roomId = leerRoomId(payload);
+      if (!roomId) {
+        emitirError(socket, "INVALID_ROOM_ID", "El ID de sala no es válido.");
+        return;
+      }
+      if (pendientes.has(roomId)) return;
+      if (pendientes.size >= MAX_ADMISIONES_PENDIENTES) {
+        emitirError(socket, "TOO_MANY_PENDING_JOINS", "Espera a que terminen tus ingresos pendientes.", roomId);
+        return;
+      }
+
+      const { sala, liberar } = vigilancia.retener(roomId);
+      const control = new AbortController();
+      const consultaCancelada = new Promise<undefined>((resolve) => {
+        control.signal.addEventListener("abort", () => resolve(undefined), { once: true });
+      });
+      const finalizar = () => {
+        clearTimeout(plazo);
+        liberar();
+        if (!admision.enAdaptador && pendientes.get(roomId) === admision) {
+          pendientes.delete(roomId);
+        }
+      };
+      const admision: AdmisionPendiente = {
+        signal: control.signal,
+        consultaCancelada,
+        enAdaptador: false,
+        cancelar() {
+          control.abort();
+          finalizar();
+        },
+      };
+      const plazo = setTimeout(() => {
+        admision.cancelar();
+        if (sala.cerrada) {
+          emitirError(socket, "ROOM_NOT_FOUND", "La sala no existe.", roomId);
+        } else {
+          emitirError(socket, "ROOM_JOIN_TIMEOUT", "Se agotó el tiempo para ingresar a la sala.", roomId);
+        }
+      }, PLAZO_ADMISION_MS);
+      pendientes.set(roomId, admision);
+      void ingresarSala(socket, roomId, dependencies, presence, vigilancia, sala, admision)
+        .finally(() => {
+          // Si el adaptador seguía uniendo el socket al vencer el plazo, el
+          // intento retiene su turno hasta que pueda revertir esa membresía.
+          admision.enAdaptador = false;
+          finalizar();
+        });
     });
     socket.on("room:leave", (payload) => {
-      void salirSala(socket, payload, presence, io);
+      void salirSala(socket, payload, presence, io, vigilancia);
     });
     socket.on("message:send", (payload) => {
-      void enviarMensaje(socket, payload, dependencies, presence, io);
+      void enviarMensaje(socket, payload, dependencies, presence, io, vigilancia);
     });
     socket.on("disconnect", () => {
+      for (const admision of pendientes.values()) admision.cancelar();
+      pendientes.clear();
       for (const salida of presence.quitarSocket(socket.id)) {
+        vigilancia.liberarSiVacia(salida.roomId);
         io.to(salida.roomId).emit("presence:update", {
           roomId: salida.roomId,
           ...salida.usuario,
