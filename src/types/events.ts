@@ -40,6 +40,7 @@ export interface ClientToServerEvents {
 export interface ServerToClientEvents {
   "room:joined": (payload: SalaUnidaPayload) => void;
   "room:left": (payload: { roomId: string }) => void;
+  "room:deleted": (payload: { roomId: string }) => void;
   "room:error": (payload: SalaErrorPayload) => void;
   "message:new": (payload: MensajeNuevoPayload) => void;
   "presence:update": (payload: PresenceUpdatePayload) => void;

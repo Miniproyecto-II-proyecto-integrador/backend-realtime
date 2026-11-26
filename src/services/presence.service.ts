@@ -84,6 +84,24 @@ export class PresenceTracker {
     return salidas;
   }
 
+  quitarSala(roomId: string): string[] {
+    const sockets: string[] = [];
+    for (const { socketIds } of this.usuariosPorSala.get(roomId)?.values() ?? []) {
+      for (const socketId of socketIds) {
+        sockets.push(socketId);
+        const salas = this.salasPorSocket.get(socketId);
+        salas?.delete(roomId);
+        if (salas?.size === 0) this.salasPorSocket.delete(socketId);
+      }
+    }
+    this.usuariosPorSala.delete(roomId);
+    return sockets;
+  }
+
+  tieneUsuarios(roomId: string): boolean {
+    return this.usuariosPorSala.has(roomId);
+  }
+
   tieneConexion(roomId: string, socketId: string, uid: string): boolean {
     return (
       this.usuariosPorSala

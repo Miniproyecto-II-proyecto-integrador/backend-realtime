@@ -11,3 +11,10 @@ export class EliminacionCuentaEnCursoError extends Error {
     this.name = "EliminacionCuentaEnCursoError";
   }
 }
+
+export class PerfilEmisorNoEncontradoError extends Error {
+  constructor() {
+    super("Tu cuenta ya no tiene un perfil activo.");
+    this.name = "PerfilEmisorNoEncontradoError";
+  }
+}
