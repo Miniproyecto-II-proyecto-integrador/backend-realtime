@@ -18,6 +18,7 @@ import { ObservarSala } from "../types/room";
 const MAX_ROOM_ID_LENGTH = 128;
 const MAX_MESSAGE_LENGTH = 2000;
 const MAX_ADMISIONES_PENDIENTES = 8;
+const MAX_ENVIOS_PENDIENTES = 8;
 const PLAZO_ADMISION_MS = 5_000;
 
 interface AdmisionPendiente {
@@ -91,6 +92,22 @@ function emitirError(
   socket.emit("room:error", { code, message, ...(roomId ? { roomId } : {}) });
 }
 
+async function verificarSesionActual(
+  socket: RealtimeSocket,
+  verificarToken: RealtimeDependencies["verifyIdToken"],
+): Promise<void> {
+  const usuario = await verificarSesionSocket(socket.handshake.auth?.token, verificarToken);
+  if (usuario.uid !== socket.data.uid) throw new Error("INVALID_TOKEN");
+}
+
+function emitirErrorSesion(socket: RealtimeSocket, roomId: string, error: unknown): void {
+  const code = error instanceof Error ? error.message : "AUTH_UNAVAILABLE";
+  const message = code === "AUTH_UNAVAILABLE"
+    ? "No se pudo verificar tu sesión. Intenta de nuevo."
+    : "Tu sesión no es válida. Vuelve a conectarte con un token vigente.";
+  emitirError(socket, code, message, roomId);
+}
+
 async function ingresarSala(
   socket: RealtimeSocket,
   roomId: string,
@@ -100,16 +117,11 @@ async function ingresarSala(
   admision: AdmisionPendiente,
 ): Promise<void> {
   try {
-    const usuario = await verificarSesionSocket(socket.handshake.auth?.token, dependencies.verifyIdToken);
+    await verificarSesionActual(socket, dependencies.verifyIdToken);
     if (admision.signal.aborted || !socket.connected) return;
-    if (usuario.uid !== socket.data.uid) throw new Error("INVALID_TOKEN");
   } catch (error) {
     if (admision.signal.aborted) return;
-    const code = error instanceof Error ? error.message : "AUTH_UNAVAILABLE";
-    const message = code === "AUTH_UNAVAILABLE"
-      ? "No se pudo verificar tu sesión. Intenta de nuevo."
-      : "Tu sesión no es válida. Vuelve a conectarte con un token vigente.";
-    emitirError(socket, code, message, roomId);
+    emitirErrorSesion(socket, roomId, error);
     return;
   } finally {
     admision.verificandoAuth = false;
@@ -259,7 +271,8 @@ async function enviarMensaje(
     return;
   }
   const sala = vigilancia.obtener(roomId);
-  if (!sala || !presence.tieneConexion(roomId, socket.id, socket.data.uid)) {
+  const membresia = presence.obtenerMembresia(roomId, socket.id, socket.data.uid);
+  if (!sala || !membresia) {
     emitirError(
       socket,
       "NOT_IN_ROOM",
@@ -280,6 +293,28 @@ async function enviarMensaje(
     );
     return;
   }
+
+  try {
+    await verificarSesionActual(socket, dependencies.verifyIdToken);
+  } catch (error) {
+    if (socket.connected && presence.obtenerMembresia(roomId, socket.id, socket.data.uid) === membresia) {
+      emitirErrorSesion(socket, roomId, error);
+    }
+    return;
+  }
+
+  if (!socket.connected) return;
+  if (sala.cerrada) {
+    emitirError(socket, "ROOM_NOT_FOUND", "La sala no existe.", roomId);
+    return;
+  }
+  const membresiaActual = presence.obtenerMembresia(roomId, socket.id, socket.data.uid);
+  if (!membresiaActual) {
+    emitirError(socket, "NOT_IN_ROOM", "Debes ingresar a la sala antes de enviar mensajes.", roomId);
+    return;
+  }
+  // Un reingreso del mismo socket no autoriza el envío anterior.
+  if (membresiaActual !== membresia) return;
 
   const { liberar } = vigilancia.retener(roomId);
   try {
@@ -343,6 +378,7 @@ export function configurarSockets(
 
   io.on("connection", (socket) => {
     const pendientes = new Map<string, AdmisionPendiente>();
+    let enviosPendientes = 0;
     socket.on("room:join", (payload) => {
       const roomId = leerRoomId(payload);
       if (!roomId) {
@@ -402,7 +438,13 @@ export function configurarSockets(
       void salirSala(socket, payload, presence, io, vigilancia);
     });
     socket.on("message:send", (payload) => {
-      void enviarMensaje(socket, payload, dependencies, presence, io, vigilancia);
+      if (enviosPendientes >= MAX_ENVIOS_PENDIENTES) {
+        emitirError(socket, "TOO_MANY_PENDING_MESSAGES", "Espera a que terminen tus envíos pendientes.", leerRoomId(payload) ?? undefined);
+        return;
+      }
+      enviosPendientes++;
+      void enviarMensaje(socket, payload, dependencies, presence, io, vigilancia)
+        .finally(() => { enviosPendientes--; });
     });
     socket.on("disconnect", () => {
       for (const admision of pendientes.values()) admision.cancelar();
