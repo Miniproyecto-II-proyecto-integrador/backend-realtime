@@ -1,5 +1,5 @@
 import { Server, Socket } from "socket.io";
-import { crearMiddlewareSocketAuth } from "../middlewares/socketAuth";
+import { crearMiddlewareSocketAuth, verificarSesionSocket } from "../middlewares/socketAuth";
 import { PresenceTracker } from "../services/presence.service";
 import { SalaVigilada, VigilanciaSalas } from "../services/room-watch.service";
 import {
@@ -22,8 +22,11 @@ const PLAZO_ADMISION_MS = 5_000;
 
 interface AdmisionPendiente {
   signal: AbortSignal;
-  consultaCancelada: Promise<undefined>;
+  cancelada: Promise<undefined>;
+  verificandoAuth: boolean;
   enAdaptador: boolean;
+  sala?: SalaVigilada;
+  liberarSala?: () => void;
   cancelar(): void;
 }
 
@@ -65,11 +68,18 @@ function leerRoomId(payload: unknown): string | null {
   if (
     normalizado.length === 0 ||
     normalizado.length > MAX_ROOM_ID_LENGTH ||
-    normalizado.includes("/")
+    normalizado === "." || normalizado === ".." ||
+    /^__[\s\S]*__$/.test(normalizado) ||
+    /[/\u0000-\u001f\u007f]/.test(normalizado)
   ) {
     return null;
   }
   return normalizado;
+}
+
+/** Socket.IO reserva un canal privado que se llama igual que el socket. */
+function canalSala(roomId: string): string {
+  return `study-room:${roomId}`;
 }
 
 function emitirError(
@@ -87,15 +97,33 @@ async function ingresarSala(
   dependencies: RealtimeDependencies,
   presence: PresenceTracker,
   vigilancia: VigilanciaSalas,
-  sala: SalaVigilada,
   admision: AdmisionPendiente,
 ): Promise<void> {
+  try {
+    const usuario = await verificarSesionSocket(socket.handshake.auth?.token, dependencies.verifyIdToken);
+    if (admision.signal.aborted || !socket.connected) return;
+    if (usuario.uid !== socket.data.uid) throw new Error("INVALID_TOKEN");
+  } catch (error) {
+    if (admision.signal.aborted) return;
+    const code = error instanceof Error ? error.message : "AUTH_UNAVAILABLE";
+    const message = code === "AUTH_UNAVAILABLE"
+      ? "No se pudo verificar tu sesión. Intenta de nuevo."
+      : "Tu sesión no es válida. Vuelve a conectarte con un token vigente.";
+    emitirError(socket, code, message, roomId);
+    return;
+  } finally {
+    admision.verificandoAuth = false;
+  }
+
+  const { sala, liberar } = vigilancia.retener(roomId);
+  admision.sala = sala;
+  admision.liberarSala = liberar;
   try {
     let room: Awaited<ReturnType<RealtimeDependencies["getRoom"]>> | undefined;
     try {
       room = sala.cerrada ? null : await Promise.race([
         dependencies.getRoom(roomId),
-        admision.consultaCancelada,
+        admision.cancelada,
       ]);
     } catch (error) {
       if (admision.signal.aborted) return;
@@ -125,9 +153,10 @@ async function ingresarSala(
     }
 
     admision.enAdaptador = true;
-    await socket.join(roomId);
+    const canal = canalSala(roomId);
+    await socket.join(canal);
     if (!socket.connected || admision.signal.aborted || sala.cerrada) {
-      await socket.leave(roomId);
+      await socket.leave(canal);
       if (socket.connected && !admision.signal.aborted) {
         emitirError(socket, "ROOM_NOT_FOUND", "La sala no existe.", roomId);
       }
@@ -144,7 +173,7 @@ async function ingresarSala(
       onlineUsers: presence.usuariosEnSala(roomId),
     });
     if (becameOnline) {
-      socket.to(roomId).emit("presence:update", {
+      socket.to(canal).emit("presence:update", {
         roomId,
         ...identity,
         status: "online",
@@ -190,7 +219,7 @@ async function salirSala(
   }
 
   try {
-    await socket.leave(roomId);
+    await socket.leave(canalSala(roomId));
   } catch (error) {
     if (sala.cerrada) return;
     console.error("[Socket.IO] error saliendo de sala:", error);
@@ -207,7 +236,7 @@ async function salirSala(
   vigilancia.liberarSiVacia(roomId);
   socket.emit("room:left", { roomId });
   if (salida?.quedoOffline) {
-    io.to(roomId).emit("presence:update", {
+    io.to(canalSala(roomId)).emit("presence:update", {
       roomId,
       ...salida.usuario,
       status: "offline",
@@ -260,7 +289,7 @@ async function enviarMensaje(
       senderName: socket.data.displayName?.trim() || "Usuario",
       content,
     });
-    if (!sala.cerrada) io.to(roomId).emit("message:new", message);
+    if (!sala.cerrada) io.to(canalSala(roomId)).emit("message:new", message);
   } catch (error) {
     if (sala.cerrada) return;
     if (error instanceof SalaNoEncontradaError) {
@@ -302,11 +331,12 @@ export function configurarSockets(
     dependencies.watchRoom,
     (roomId) => presence.tieneUsuarios(roomId),
     (roomId) => {
+      const canal = canalSala(roomId);
       for (const socketId of presence.quitarSala(roomId)) {
         const socket = io.sockets.sockets.get(socketId);
-        if (socket?.rooms.has(roomId)) socket.emit("room:deleted", { roomId });
+        if (socket?.rooms.has(canal)) socket.emit("room:deleted", { roomId });
       }
-      io.in(roomId).socketsLeave(roomId);
+      io.in(canal).socketsLeave(canal);
     },
   );
   io.use(crearMiddlewareSocketAuth(dependencies.verifyIdToken));
@@ -319,43 +349,48 @@ export function configurarSockets(
         emitirError(socket, "INVALID_ROOM_ID", "El ID de sala no es válido.");
         return;
       }
-      if (pendientes.has(roomId)) return;
-      if (pendientes.size >= MAX_ADMISIONES_PENDIENTES) {
+      const anterior = pendientes.get(roomId);
+      if (anterior && !anterior.signal.aborted) return;
+      if (anterior || pendientes.size >= MAX_ADMISIONES_PENDIENTES) {
         emitirError(socket, "TOO_MANY_PENDING_JOINS", "Espera a que terminen tus ingresos pendientes.", roomId);
         return;
       }
 
-      const { sala, liberar } = vigilancia.retener(roomId);
       const control = new AbortController();
-      const consultaCancelada = new Promise<undefined>((resolve) => {
+      const cancelada = new Promise<undefined>((resolve) => {
         control.signal.addEventListener("abort", () => resolve(undefined), { once: true });
       });
+      let plazo: NodeJS.Timeout | undefined;
       const finalizar = () => {
         clearTimeout(plazo);
-        liberar();
-        if (!admision.enAdaptador && pendientes.get(roomId) === admision) {
+        plazo = undefined;
+        admision.liberarSala?.();
+        admision.liberarSala = undefined;
+        // El plazo cancela el ingreso, pero Auth o el adaptador pueden seguir trabajando.
+        if (!admision.verificandoAuth && !admision.enAdaptador && pendientes.get(roomId) === admision) {
           pendientes.delete(roomId);
         }
       };
       const admision: AdmisionPendiente = {
         signal: control.signal,
-        consultaCancelada,
+        cancelada,
+        verificandoAuth: true,
         enAdaptador: false,
         cancelar() {
           control.abort();
           finalizar();
         },
       };
-      const plazo = setTimeout(() => {
+      plazo = setTimeout(() => {
         admision.cancelar();
-        if (sala.cerrada) {
+        if (admision.sala?.cerrada) {
           emitirError(socket, "ROOM_NOT_FOUND", "La sala no existe.", roomId);
         } else {
           emitirError(socket, "ROOM_JOIN_TIMEOUT", "Se agotó el tiempo para ingresar a la sala.", roomId);
         }
       }, PLAZO_ADMISION_MS);
       pendientes.set(roomId, admision);
-      void ingresarSala(socket, roomId, dependencies, presence, vigilancia, sala, admision)
+      void ingresarSala(socket, roomId, dependencies, presence, vigilancia, admision)
         .finally(() => {
           // Si el adaptador seguía uniendo el socket al vencer el plazo, el
           // intento retiene su turno hasta que pueda revertir esa membresía.
@@ -371,10 +406,9 @@ export function configurarSockets(
     });
     socket.on("disconnect", () => {
       for (const admision of pendientes.values()) admision.cancelar();
-      pendientes.clear();
       for (const salida of presence.quitarSocket(socket.id)) {
         vigilancia.liberarSiVacia(salida.roomId);
-        io.to(salida.roomId).emit("presence:update", {
+        io.to(canalSala(salida.roomId)).emit("presence:update", {
           roomId: salida.roomId,
           ...salida.usuario,
           status: "offline",

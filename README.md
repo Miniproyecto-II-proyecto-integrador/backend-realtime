@@ -61,8 +61,8 @@ io(url, { auth: { token: firebaseIdToken } });
 
 | Evento | Dirección | Payload / respuesta | Errores |
 |---|---|---|---|
-| `connection` | cliente → servidor (handshake; aceptación del servidor) | Conexión aceptada tras verificar el token. | `connect_error`: `AUTH_REQUIRED`, `INVALID_TOKEN` o `AUTH_UNAVAILABLE`. |
-| `room:join` | cliente → servidor | `{ roomId }`. Los ingresos simultáneos para el mismo socket y sala comparten un solo resultado. | `room:error`: `INVALID_ROOM_ID`, `ROOM_NOT_FOUND`, `ROOM_LOOKUP_FAILED`, `ROOM_JOIN_FAILED`, `ROOM_JOIN_TIMEOUT` o `TOO_MANY_PENDING_JOINS`. |
+| `connect` | Socket.IO → cliente | Confirma la conexión tras verificar el token del handshake. | `connect_error.message`: `AUTH_REQUIRED`, `INVALID_TOKEN` o `AUTH_UNAVAILABLE`. |
+| `room:join` | cliente → servidor | `{ roomId }`. Los ingresos simultáneos para el mismo socket y sala comparten un resultado mientras el intento está vigente. | `room:error`: `INVALID_ROOM_ID`, `INVALID_TOKEN`, `AUTH_REQUIRED`, `AUTH_UNAVAILABLE`, `ROOM_NOT_FOUND`, `ROOM_LOOKUP_FAILED`, `ROOM_JOIN_FAILED`, `ROOM_JOIN_TIMEOUT` o `TOO_MANY_PENDING_JOINS`. |
 | `room:joined` | servidor → cliente | `{ roomId, roomName, onlineUsers: [{ uid, displayName }] }`. | Se emite solo después de comprobar y unir el socket a la sala. |
 | `room:leave` | cliente → servidor | `{ roomId }`. | `room:error`: `INVALID_ROOM_ID`, `NOT_IN_ROOM` o `ROOM_LEAVE_FAILED`. |
 | `room:left` | servidor → cliente | `{ roomId }` tras completar una salida solicitada, incluso si coincide con el cierre. | No se emite si la solicitud de salida es inválida. |
@@ -71,10 +71,19 @@ io(url, { auth: { token: firebaseIdToken } });
 | `message:send` | cliente → servidor | `{ roomId, content }`; máximo 2000 caracteres. El emisor se obtiene de la sesión y necesita un perfil existente. | `room:error`: `INVALID_ROOM_ID`, `NOT_IN_ROOM`, `INVALID_CONTENT`, `ROOM_NOT_FOUND`, `ACCOUNT_DELETION_IN_PROGRESS`, `ACCOUNT_NOT_AVAILABLE` o `MESSAGE_PERSISTENCE_FAILED`. |
 | `message:new` | servidor → miembros de la sala | `{ id, roomId, senderUid, senderName, content, createdAt }`. Se emite después de guardar en Firestore. | Si falla el guardado, no se emite. |
 | `presence:update` | servidor → otros miembros de la sala | `{ roomId, uid, displayName, status: "online" \| "offline" }`. Solo cambia al conectarse el primer socket o desconectarse el último del usuario en esa sala. | No se emite por una desconexión individual si quedan otros sockets activos. |
-| `disconnect` | cliente o servidor → contraparte | Evento Socket.IO sin payload; el servidor limpia la presencia de ese socket. | No aplica. |
+| `disconnect` | Socket.IO → cliente y servidor | Evento local de Socket.IO con el motivo de desconexión. El servidor limpia la presencia de ese socket. | No aplica. |
 
-El servidor obtiene la identidad exclusivamente de `verifyIdToken` durante el
-handshake. No acepta UID del payload para unirse o enviar mensajes.
+El servidor obtiene la identidad del token verificado durante el handshake.
+Firebase Auth comprueba también la revocación y el estado de la cuenta al conectar
+y antes de admitir cada `room:join`. Un socket que siga abierto después de que su
+token venza o se revoque, o su cuenta se elimine o deshabilite, recibe
+`room:error` con `code: "INVALID_TOKEN"` al intentar un ingreso. La comprobación
+ocurre antes de consultar Firestore y comparte el plazo de cinco segundos del ingreso.
+
+Para `room:join`, `roomId` debe ser texto. Se recorta y debe tener entre 1 y 128
+caracteres. Se rechazan barras, caracteres de control, `.` y `..`, e IDs reservados
+del tipo `__...__`. La API y Socket.IO usan el mismo ID público en sus contratos.
+Los canales internos de estudio se distinguen del canal privado de cada socket.
 
 El documento `rooms/{roomId}` admite `closingAt: Timestamp` opcional. Su presencia
 bloquea ingresos y escrituras mientras la API limpia las subcolecciones. El ingreso
@@ -88,6 +97,25 @@ pendientes. Libera la suscripción cuando termina el último uso. Ante un error
 terminal vuelve a suscribirse con espera incremental mientras la sala siga en uso.
 Las comprobaciones contra Firestore continúan durante ese intervalo. Cada socket
 admite hasta ocho ingresos pendientes y cada ingreso tiene un plazo de cinco segundos.
+Si el plazo vence mientras Firebase Auth sigue verificando, el cliente recibe
+`ROOM_JOIN_TIMEOUT` y esa verificación sigue ocupando un cupo hasta que termina.
+El servidor responde `TOO_MANY_PENDING_JOINS` si se agotan los cupos o si se
+reintenta la misma sala mientras el intento vencido todavía ocupa su cupo.
+
+### Renovación del token
+
+El mismo flujo aplica a `INVALID_TOKEN` en `room:error.code` y `connect_error.message`.
+
+1. Obtén un ID token vigente con `firebaseUser.getIdToken(true)`. Si Firebase
+   exige iniciar sesión de nuevo, completa ese paso antes de continuar.
+2. Cierra la conexión anterior si sigue abierta y asigna `socket.auth = { token }`.
+3. Registra un listener con `socket.once("connect", ...)` antes de llamar a
+   `socket.connect()` para establecer una nueva conexión autenticada.
+4. Al recibir `connect`, vuelve a emitir `room:join` con el `roomId` original.
+
+Ante `AUTH_UNAVAILABLE`, conserva el token y aplica una espera progresiva entre
+reintentos. Si falló el handshake, reintenta la conexión. Si el socket sigue
+conectado y falló el ingreso, vuelve a emitir `room:join` después de la espera.
 
 ## Variables de entorno
 
