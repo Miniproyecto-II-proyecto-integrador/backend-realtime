@@ -68,17 +68,18 @@ io(url, { auth: { token: firebaseIdToken } });
 | `room:left` | servidor → cliente | `{ roomId }` tras completar una salida solicitada, incluso si coincide con el cierre. | No se emite si la solicitud de salida es inválida. |
 | `room:deleted` | servidor → miembros conectados de la sala | `{ roomId }`. Se emite al observar el cierre o la eliminación, también si se originó al eliminar una cuenta. | Los sockets salen solo de esa sala y se elimina su presencia en ella. |
 | `room:error` | servidor → cliente | `{ roomId?, code, message }`. | Respuesta de error a operaciones de sala o mensaje. |
-| `message:send` | cliente → servidor | `{ roomId, content }`; máximo 2000 caracteres. El emisor se obtiene de la sesión y necesita un perfil existente. | `room:error`: `INVALID_ROOM_ID`, `NOT_IN_ROOM`, `INVALID_CONTENT`, `ROOM_NOT_FOUND`, `ACCOUNT_DELETION_IN_PROGRESS`, `ACCOUNT_NOT_AVAILABLE` o `MESSAGE_PERSISTENCE_FAILED`. |
+| `message:send` | cliente → servidor | `{ roomId, content }`; texto recortado de 1 a 2000 caracteres. El servidor verifica la sesión y la membresía. Admite hasta ocho envíos en curso por socket. | `room:error`: `INVALID_ROOM_ID`, `NOT_IN_ROOM`, `INVALID_CONTENT`, `AUTH_REQUIRED`, `INVALID_TOKEN`, `AUTH_UNAVAILABLE`, `TOO_MANY_PENDING_MESSAGES`, `ROOM_NOT_FOUND`, `ACCOUNT_DELETION_IN_PROGRESS`, `ACCOUNT_NOT_AVAILABLE` o `MESSAGE_PERSISTENCE_FAILED`. |
 | `message:new` | servidor → miembros de la sala | `{ id, roomId, senderUid, senderName, content, createdAt }`. Se emite después de guardar en Firestore. | Si falla el guardado, no se emite. |
 | `presence:update` | servidor → otros miembros de la sala | `{ roomId, uid, displayName, status: "online" \| "offline" }`. Solo cambia al conectarse el primer socket o desconectarse el último del usuario en esa sala. | No se emite por una desconexión individual si quedan otros sockets activos. |
 | `disconnect` | Socket.IO → cliente y servidor | Evento local de Socket.IO con el motivo de desconexión. El servidor limpia la presencia de ese socket. | No aplica. |
 
 El servidor obtiene la identidad del token verificado durante el handshake.
-Firebase Auth comprueba también la revocación y el estado de la cuenta al conectar
-y antes de admitir cada `room:join`. Un socket que siga abierto después de que su
+Firebase Auth comprueba también la revocación y el estado de la cuenta al conectar,
+al ingresar y al enviar un mensaje. Un socket que siga abierto después de que su
 token venza o se revoque, o su cuenta se elimine o deshabilite, recibe
-`room:error` con `code: "INVALID_TOKEN"` al intentar un ingreso. La comprobación
-ocurre antes de consultar Firestore y comparte el plazo de cinco segundos del ingreso.
+`room:error` con `code: "INVALID_TOKEN"` al intentar ingresar o enviar. La comprobación
+ocurre antes de consultar o escribir en Firestore. En `room:join` comparte el plazo
+de cinco segundos del ingreso.
 
 Para `room:join`, `roomId` debe ser texto. Se recorta y debe tener entre 1 y 128
 caracteres. Se rechazan barras, caracteres de control, `.` y `..`, e IDs reservados
@@ -116,6 +117,71 @@ El mismo flujo aplica a `INVALID_TOKEN` en `room:error.code` y `connect_error.me
 Ante `AUTH_UNAVAILABLE`, conserva el token y aplica una espera progresiva entre
 reintentos. Si falló el handshake, reintenta la conexión. Si el socket sigue
 conectado y falló el ingreso, vuelve a emitir `room:join` después de la espera.
+Si el fallo se produjo al enviar, conserva el borrador para un reintento explícito.
+
+### Chat tras una desconexión
+
+Realtime recibe `message:send`, vuelve a comprobar la sesión y confirma que la
+membresía original del socket sigue vigente. Si el socket salió y volvió a
+ingresar mientras se verificaba la sesión, el envío anterior se descarta.
+Firestore crea el mensaje en una transacción que comprueba que la sala siga
+activa y que el emisor tenga perfil y no esté eliminando su cuenta. Si la escritura
+ya comenzó con autorización válida, puede completarse después de que salga el
+emisor. Tras guardar se emite `message:new` a quienes sigan en la sala. La emisión
+se omite si ya se observó su cierre. Si falla la escritura, el cliente recibe un
+error cuando su conexión sigue activa y el servidor todavía está atendiendo esa sala.
+
+El frontend obtiene el token y dirige la reconexión. Cada conexión nueva requiere
+un nuevo `room:join`. Instala un solo listener de `message:new` por cliente antes
+de reingresar, filtra por sala y acumula los eventos mientras recuperas el historial.
+Usa el último mensaje conocido de un tramo continuo como punto de referencia.
+Captúralo antes de mezclar los eventos nuevos.
+
+```text
+al desconectar:
+  pausar envíos y cancelar la recuperación anterior
+  guardar el ID del último mensaje del tramo continuo
+  reconectar con espera progresiva y un token vigente
+
+al conectar:
+  empezar un búfer de eventos para la sala activa
+  emitir room:join({ roomId }) y esperar room:joined
+  pedir GET /api/rooms/{roomId}/messages con Authorization: Bearer <token>
+  mientras exista un ID de referencia, todavía falte y hasMore sea true:
+    pedir la página anterior usando nextCursor de esta misma sala
+  si se encontró el ID de referencia y hasMore es true:
+    opcionalmente pedir una página anterior adicional como solapamiento
+  combinar páginas, caché y búfer por (roomId, id)
+  aplicar los eventos siguientes a la misma colección y habilitar los envíos
+```
+
+`backend-api` (US-11) devuelve `{ messages, nextCursor, hasMore }`. Conserva el
+orden cronológico de cada página, antepone las páginas anteriores según su cursor
+y trata `nextCursor` como opaco. El historial puede incluir `senderUid: null`
+por anonimización. Usa la copia del historial si un mismo ID aparece en ambas
+fuentes, así se reflejan los datos anonimizados. Si el cursor dejó de ser válido,
+repite la recuperación desde la página más reciente.
+
+Cada página del historial se lee en una instantánea independiente. Encontrar el
+ID de referencia puede dejar fuera escrituras tardías, porque un mensaje puede
+confirmarse después con un `createdAt` anterior a esa referencia o quedar en un
+tramo que ya se consultó. Volver a leer un tramo acotado de páginas alrededor de
+la referencia reduce el riesgo de omisiones. Aun con ese solapamiento pueden
+quedar escrituras fuera del tramo rescatado.
+
+Si llega `room:deleted`, `room:error` con `ROOM_NOT_FOUND` al reingresar, o un
+`404` del historial para esa sala, cancela la recuperación y sus reintentos y sal
+de la sala en la interfaz. Al cambiar de sala o desconectar de nuevo, descarta
+las respuestas y el búfer del intento anterior.
+
+Deduplicar por `(roomId, id)` evita mostrar dos veces el mismo documento cuando
+llega por el historial y por Socket.IO. Si la conexión se corta antes de recibir
+el evento de un envío, el historial puede ayudar a encontrarlo y el resultado
+aún puede quedar indeterminado para el cliente. El sistema carece de claves de
+idempotencia y de confirmaciones por envío. La entrega exactamente una vez queda
+fuera de las garantías del contrato. Un reenvío de resultado incierto puede crear
+un documento duplicado con otro ID. Recupera el historial antes de ofrecer un
+reenvío manual.
 
 ## Variables de entorno
 

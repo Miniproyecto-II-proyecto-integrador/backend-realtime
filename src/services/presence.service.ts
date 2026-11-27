@@ -2,7 +2,7 @@ import { UsuarioPresente } from "../types/events";
 
 interface UsuarioConexiones {
   usuario: UsuarioPresente;
-  socketIds: Set<string>;
+  membresias: Map<string, symbol>;
 }
 
 interface SalidaPresencia {
@@ -31,11 +31,11 @@ export class PresenceTracker {
     let conexiones = usuarios.get(usuario.uid);
     const esPrimeraConexion = !conexiones;
     if (!conexiones) {
-      conexiones = { usuario, socketIds: new Set() };
+      conexiones = { usuario, membresias: new Map() };
       usuarios.set(usuario.uid, conexiones);
     }
-    if (conexiones.socketIds.has(socketId)) return false;
-    conexiones.socketIds.add(socketId);
+    if (conexiones.membresias.has(socketId)) return false;
+    conexiones.membresias.set(socketId, Symbol());
 
     let salas = this.salasPorSocket.get(socketId);
     if (!salas) {
@@ -54,16 +54,16 @@ export class PresenceTracker {
     if (!usuarios) return null;
 
     const entrada = [...usuarios.values()].find((item) =>
-      item.socketIds.has(socketId),
+      item.membresias.has(socketId),
     );
     if (!entrada) return null;
-    entrada.socketIds.delete(socketId);
+    entrada.membresias.delete(socketId);
     this.salasPorSocket.get(socketId)?.delete(roomId);
     if (this.salasPorSocket.get(socketId)?.size === 0) {
       this.salasPorSocket.delete(socketId);
     }
 
-    if (entrada.socketIds.size > 0) {
+    if (entrada.membresias.size > 0) {
       return { usuario: entrada.usuario, quedoOffline: false };
     }
     usuarios.delete(entrada.usuario.uid);
@@ -86,8 +86,8 @@ export class PresenceTracker {
 
   quitarSala(roomId: string): string[] {
     const sockets: string[] = [];
-    for (const { socketIds } of this.usuariosPorSala.get(roomId)?.values() ?? []) {
-      for (const socketId of socketIds) {
+    for (const { membresias } of this.usuariosPorSala.get(roomId)?.values() ?? []) {
+      for (const socketId of membresias.keys()) {
         sockets.push(socketId);
         const salas = this.salasPorSocket.get(socketId);
         salas?.delete(roomId);
@@ -102,13 +102,12 @@ export class PresenceTracker {
     return this.usuariosPorSala.has(roomId);
   }
 
+  obtenerMembresia(roomId: string, socketId: string, uid: string): symbol | undefined {
+    return this.usuariosPorSala.get(roomId)?.get(uid)?.membresias.get(socketId);
+  }
+
   tieneConexion(roomId: string, socketId: string, uid: string): boolean {
-    return (
-      this.usuariosPorSala
-        .get(roomId)
-        ?.get(uid)
-        ?.socketIds.has(socketId) ?? false
-    );
+    return this.obtenerMembresia(roomId, socketId, uid) !== undefined;
   }
 
   usuariosEnSala(roomId: string): UsuarioPresente[] {

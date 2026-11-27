@@ -782,8 +782,256 @@ describe("servidor realtime", () => {
     assert.equal(harness.messages.length, 0);
   });
 
-  it("persiste antes de emitir y distribuye solo dentro de la sala", async () => {
+  it("revalida al emisor antes de guardar y distingue una sesión inválida de una falla de Auth", async () => {
+    let fallo: string | undefined;
+    const harness = await crearHarness({
+      async verifyIdToken() {
+        if (fallo) throw Object.assign(new Error("Fallo de Auth simulado"), { code: fallo });
+        return { uid: "uid-alice", name: "Alice" };
+      },
+    });
+    harnesses.add(harness);
+    const alice = harness.connect("alice");
+    await conectado(alice);
+    await ingresar(alice, "room-a");
+
+    for (const [codigo, esperado] of [
+      ["auth/id-token-revoked", "INVALID_TOKEN"],
+      ["auth/id-token-expired", "INVALID_TOKEN"],
+      ["auth/user-disabled", "INVALID_TOKEN"],
+      ["auth/user-not-found", "INVALID_TOKEN"],
+      ["auth/internal-error", "AUTH_UNAVAILABLE"],
+    ]) {
+      fallo = codigo;
+      const error = await errorDeSala(alice, () => {
+        alice.emit("message:send", { roomId: "room-a", content: "No guardar" });
+      });
+      assert.equal(error.code, esperado);
+      assert.equal(error.roomId, "room-a");
+    }
+    assert.deepEqual(harness.messages, []);
+
+    fallo = undefined;
+    const recibido = new Promise<MensajeNuevoPayload>((resolve) => alice.once("message:new", resolve));
+    alice.emit("message:send", { roomId: "room-a", content: "Guardar" });
+    assert.deepEqual(await recibido, harness.messages[0]);
+    assert.equal(harness.messages.length, 1);
+  });
+
+  it("descarta un envío pendiente de Auth si el mismo socket sale y vuelve a ingresar", { timeout: 5_000 }, async (t) => {
+    const authIniciada = diferir<void>();
+    const authPendiente = diferir<{ uid: string }>();
+    let pausarSiguienteAuth = false;
+    const saveMessage = t.mock.fn(async (input: Parameters<RealtimeDependencies["saveMessage"]>[0]) => ({
+      ...input, id: "mensaje-nuevo", createdAt: "2026-11-26T12:00:00.000Z",
+    }));
+    const harness = await crearHarness({
+      async verifyIdToken(token) {
+        if (!pausarSiguienteAuth) return { uid: token };
+        pausarSiguienteAuth = false;
+        authIniciada.resolver();
+        return authPendiente.promesa;
+      },
+      saveMessage,
+    });
+    harnesses.add(harness);
+    const alice = harness.connect("alice");
+    const bob = harness.connect("bob");
+    await Promise.all([conectado(alice), conectado(bob)]);
+    await Promise.all([ingresar(alice, "room-a"), ingresar(bob, "room-a")]);
+
+    const socketId = alice.id!;
+    const socket = harness.app.io.sockets.sockets.get(socketId)!;
+    const { presence, io } = harness.app;
+    const membresiaOriginal = presence.obtenerMembresia("room-a", socketId, "alice");
+    assert.ok(membresiaOriginal);
+    const suscripciones = harness.suscripciones.get("room-a")!;
+    const broadcast = t.mock.method(io.sockets.adapter, "broadcast");
+    const emitir = t.mock.method(socket, "emit");
+
+    pausarSiguienteAuth = true;
+    alice.emit("message:send", { roomId: "room-a", content: "Envío anterior" });
+    await authIniciada.promesa;
+    const salida = new Promise<void>((resolve) => alice.once("room:left", () => resolve()));
+    alice.emit("room:leave", { roomId: "room-a" });
+    await salida;
+    assert.equal(presence.obtenerMembresia("room-a", socketId, "alice"), undefined);
+    assert.deepEqual(presence.usuariosEnSala("room-a").map(({ uid }) => uid), ["bob"]);
+    await ingresar(alice, "room-a");
+    assert.equal(alice.id, socketId);
+    assert.ok(presence.obtenerMembresia("room-a", socketId, "alice"));
+    assert.notEqual(presence.obtenerMembresia("room-a", socketId, "alice"), membresiaOriginal);
+    assert.equal(suscripciones.length, 1);
+    assert.equal(suscripciones[0].activa, true);
+
+    const emisiones = emitir.mock.callCount();
+    const difusiones = broadcast.mock.callCount();
+    authPendiente.resolver({ uid: "alice" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(saveMessage.mock.callCount(), 0);
+    assert.equal(emitir.mock.callCount(), emisiones);
+    assert.equal(broadcast.mock.callCount(), difusiones);
+
+    const recibido = new Promise<MensajeNuevoPayload>((resolve) => bob.once("message:new", resolve));
+    alice.emit("message:send", { roomId: "room-a", content: "Envío nuevo" });
+    assert.equal((await recibido).content, "Envío nuevo");
+    assert.equal(saveMessage.mock.callCount(), 1);
+  });
+
+  it("conserva la membresía y el envío pendiente si el socket repite room:join", { timeout: 5_000 }, async () => {
+    const identidad = { uid: "alice" };
+    const authIniciada = diferir<void>();
+    const authPendiente = diferir<typeof identidad>();
+    let pausarSiguienteAuth = false;
+    const harness = await crearHarness({
+      async verifyIdToken() {
+        if (!pausarSiguienteAuth) return identidad;
+        pausarSiguienteAuth = false;
+        authIniciada.resolver();
+        return authPendiente.promesa;
+      },
+    });
+    harnesses.add(harness);
+    const alice = harness.connect("alice");
+    await conectado(alice);
+    await ingresar(alice, "room-a");
+    const { presence } = harness.app;
+    const membresia = presence.obtenerMembresia("room-a", alice.id!, "alice");
+    assert.ok(membresia);
+
+    pausarSiguienteAuth = true;
+    const recibido = new Promise<MensajeNuevoPayload>((resolve) => alice.once("message:new", resolve));
+    alice.emit("message:send", { roomId: "room-a", content: "Envío vigente" });
+    await authIniciada.promesa;
+    await ingresar(alice, "room-a");
+    assert.equal(presence.obtenerMembresia("room-a", alice.id!, "alice"), membresia);
+    assert.equal(harness.suscripciones.get("room-a")?.length, 1);
+    authPendiente.resolver(identidad);
+    assert.equal((await recibido).content, "Envío vigente");
+    assert.equal(harness.messages.length, 1);
+  });
+
+  it("acota los envíos durante Auth y descarta los que siguen pendientes al desconectar", { timeout: 5_000 }, async (t) => {
+    const identidad = { uid: "uid-alice" };
+    const primera = diferir<typeof identidad>();
+    const restantes = diferir<typeof identidad>();
+    let retenerAuth = false;
+    let pendientes = 0;
+    const verifyIdToken = t.mock.fn(async () => {
+      if (!retenerAuth) return identidad;
+      return ++pendientes === 1 ? primera.promesa : restantes.promesa;
+    });
+    const harness = await crearHarness({ verifyIdToken });
+    harnesses.add(harness);
+    const alice = harness.connect("alice");
+    await conectado(alice);
+    await ingresar(alice, "room-a");
+    const socket = harness.app.io.sockets.sockets.get(alice.id!)!;
+    retenerAuth = true;
+    const enviar = (content: string) => alice.emit("message:send", { roomId: "room-a", content });
+
+    for (let i = 0; i < 8; i++) enviar(`Mensaje ${i}`);
+    assert.equal((await errorDeSala(alice, () => enviar("Exceso"))).code, "TOO_MANY_PENDING_MESSAGES");
+    assert.equal(verifyIdToken.mock.callCount(), 10); // Handshake, ingreso y ocho envíos.
+    assert.deepEqual(harness.messages, []);
+
+    const recibido = new Promise<MensajeNuevoPayload>((resolve) => alice.once("message:new", resolve));
+    primera.resolver(identidad);
+    assert.equal((await recibido).content, "Mensaje 0");
+    retenerAuth = false;
+    const nuevo = new Promise<MensajeNuevoPayload>((resolve) => alice.once("message:new", resolve));
+    enviar("Cupo liberado");
+    assert.equal((await nuevo).content, "Cupo liberado");
+
+    const desconectado = new Promise<void>((resolve) => socket.once("disconnect", () => resolve()));
+    alice.disconnect();
+    await desconectado;
+    restantes.resolver(identidad);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(harness.messages.map(({ content }) => content), ["Mensaje 0", "Cupo liberado"]);
+    assert.equal(harness.app.presence.obtenerMembresia("room-a", socket.id, identidad.uid), undefined);
+    assert.deepEqual(harness.app.presence.usuariosEnSala("room-a"), []);
+    assert.equal(harness.suscripciones.get("room-a")?.[0].activa, false);
+  });
+
+  it("rechaza un envío si la sala se cierra mientras Auth comprueba al emisor", { timeout: 5_000 }, async () => {
+    const identidad = { uid: "uid-alice" };
+    const iniciada = diferir<void>();
+    const verificacion = diferir<typeof identidad>();
+    let retenerAuth = false;
+    const harness = await crearHarness({
+      async verifyIdToken() {
+        if (!retenerAuth) return identidad;
+        iniciada.resolver();
+        return verificacion.promesa;
+      },
+    });
+    harnesses.add(harness);
+    const alice = harness.connect("alice");
+    await conectado(alice);
+    await ingresar(alice, "room-a");
+    retenerAuth = true;
+    const aviso = salaEliminada(alice);
+    const rechazo = errorDeSala(alice, () => {
+      alice.emit("message:send", { roomId: "room-a", content: "No guardar" });
+    });
+    await iniciada.promesa;
+    harness.cerrarSala("room-a");
+    assert.deepEqual(await aviso, { roomId: "room-a" });
+    assert.equal(harness.app.presence.obtenerMembresia("room-a", alice.id!, identidad.uid), undefined);
+    assert.equal(harness.suscripciones.get("room-a")?.[0].activa, false);
+    verificacion.resolver(identidad);
+    assert.equal((await rechazo).code, "ROOM_NOT_FOUND");
+    assert.deepEqual(harness.messages, []);
+  });
+
+  it("reconecta con otro token, exige reingresar y rechaza una sala cerrada durante la desconexión", { timeout: 5_000 }, async () => {
     const harness = await nuevoHarness();
+    const alice = harness.connect("alice");
+    await conectado(alice);
+    await ingresar(alice, "room-a");
+    const anterior = alice.id!;
+    const socket = harness.app.io.sockets.sockets.get(anterior)!;
+    const desconectado = new Promise<void>((resolve) => socket.once("disconnect", () => resolve()));
+    alice.disconnect();
+    await desconectado;
+    assert.deepEqual(harness.app.presence.usuariosEnSala("room-a"), []);
+
+    alice.auth = { token: "alice2" };
+    alice.connect();
+    await conectado(alice);
+    assert.notEqual(alice.id, anterior);
+    const sinIngreso = await errorDeSala(alice, () => {
+      alice.emit("message:send", { roomId: "room-a", content: "Antes de reingresar" });
+    });
+    assert.equal(sinIngreso.code, "NOT_IN_ROOM");
+    assert.deepEqual((await ingresar(alice, "room-a")).onlineUsers, [{ uid: "uid-alice", displayName: "Alice" }]);
+    const recibido = new Promise<MensajeNuevoPayload>((resolve) => alice.once("message:new", resolve));
+    alice.emit("message:send", { roomId: "room-a", content: "Después de reingresar" });
+    assert.equal((await recibido).content, "Después de reingresar");
+
+    const segundoSocket = harness.app.io.sockets.sockets.get(alice.id!)!;
+    const segundaSalida = new Promise<void>((resolve) => segundoSocket.once("disconnect", () => resolve()));
+    alice.disconnect();
+    await segundaSalida;
+    harness.cerrarSala("room-a");
+    alice.connect();
+    await conectado(alice);
+    const cerrada = await errorDeSala(alice, () => alice.emit("room:join", { roomId: "room-a" }));
+    assert.equal(cerrada.code, "ROOM_NOT_FOUND");
+    assert.deepEqual(harness.app.presence.usuariosEnSala("room-a"), []);
+  });
+
+  it("persiste antes de emitir y distribuye solo dentro de la sala", { timeout: 5_000 }, async (t) => {
+    const guardadoEnCurso = diferir<Parameters<RealtimeDependencies["saveMessage"]>[0]>();
+    const terminarGuardado = diferir<MensajePersistido>();
+    const harness = await crearHarness({
+      saveMessage(input) {
+        guardadoEnCurso.resolver(input);
+        return terminarGuardado.promesa;
+      },
+    });
+    harnesses.add(harness);
     const emisor = harness.connect("alice");
     const colega = harness.connect("bob");
     const otraSala = harness.connect("guest");
@@ -800,28 +1048,23 @@ describe("servidor realtime", () => {
           cliente.once("message:new", resolve),
         ),
     );
-    let recibioOtraSala = false;
-    const persistidoAlEmitir: boolean[] = [];
-    for (const cliente of [emisor, colega]) {
-      cliente.once("message:new", () => {
-        persistidoAlEmitir.push(harness.messages.length === 1);
-      });
-    }
-    otraSala.once("message:new", () => {
-      recibioOtraSala = true;
-    });
+    const adapter = harness.app.io.sockets.adapter;
+    const broadcast = t.mock.method(adapter, "broadcast");
+    const emisiones = () => broadcast.mock.calls.filter(({ arguments: [packet] }) => packet.data[0] === "message:new");
 
-    emisor.emit("message:send", { roomId: "room-a", content: " Hola " });
-    const mensajesRecibidos = await Promise.all(eventos);
-    assert.equal(harness.messages.length, 1);
-    assert.equal(mensajesRecibidos[0].senderUid, "uid-alice");
-    assert.equal(mensajesRecibidos[0].senderName, "Alice");
-    assert.equal(mensajesRecibidos[0].content, "Hola");
-    assert.equal(mensajesRecibidos[0].id, harness.messages[0].id);
-    assert.deepEqual(persistidoAlEmitir, [true, true]);
+    const solicitud = { roomId: "room-a", content: " Hola ", senderUid: "uid-bob", senderName: "Bob" };
+    emisor.emit("message:send", solicitud);
+    const input = await guardadoEnCurso.promesa;
+    assert.deepEqual(input, { roomId: "room-a", senderUid: "uid-alice", senderName: "Alice", content: "Hola" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(emisiones().length, 0);
 
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    assert.equal(recibioOtraSala, false);
+    const persistido = { ...input, id: "mensaje-guardado", createdAt: "2026-11-26T12:00:00.000Z" };
+    terminarGuardado.resolver(persistido);
+    assert.deepEqual(await Promise.all(eventos), [persistido, persistido]);
+    assert.equal(emisiones().length, 1);
+    assert.deepEqual(emisiones()[0].arguments[1].rooms, new Set(["study-room:room-a"]));
+    assert.equal(adapter.rooms.get("study-room:room-a")?.has(otraSala.id!), false);
   });
 
   it("mantiene presencia hasta que se desconecta el último socket de un usuario", async () => {
@@ -860,10 +1103,13 @@ describe("servidor realtime", () => {
     assert.equal((await offline).status, "offline");
   });
 
-  it("no anuncia un mensaje cuando falla su persistencia", async () => {
+  it("no anuncia un mensaje cuando falla su persistencia", { timeout: 5_000 }, async (t) => {
+    const guardadoEnCurso = diferir<void>();
+    const terminarGuardado = diferir<MensajePersistido>();
     const harness = await crearHarness({
-      saveMessage: async () => {
-        throw new Error("Firestore unavailable");
+      saveMessage() {
+        guardadoEnCurso.resolver();
+        return terminarGuardado.promesa;
       },
     });
     harnesses.add(harness);
@@ -872,16 +1118,17 @@ describe("servidor realtime", () => {
     await Promise.all([conectado(emisor), conectado(colega)]);
     await Promise.all([ingresar(emisor, "room-a"), ingresar(colega, "room-a")]);
 
-    let mensajeAnunciado = false;
-    colega.once("message:new", () => {
-      mensajeAnunciado = true;
-    });
-    const error = await errorDeSala(emisor, () =>
+    const broadcast = t.mock.method(harness.app.io.sockets.adapter, "broadcast");
+    const emisiones = () => broadcast.mock.calls.filter(({ arguments: [packet] }) => packet.data[0] === "message:new");
+    const rechazo = errorDeSala(emisor, () =>
       emisor.emit("message:send", { roomId: "room-a", content: "No guardar" }),
     );
-    assert.equal(error.code, "MESSAGE_PERSISTENCE_FAILED");
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    assert.equal(mensajeAnunciado, false);
+    await guardadoEnCurso.promesa;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(emisiones().length, 0);
+    terminarGuardado.rechazar(new Error("Firestore unavailable"));
+    assert.equal((await rechazo).code, "MESSAGE_PERSISTENCE_FAILED");
+    assert.equal(emisiones().length, 0);
   });
 
   it("limpia presencia al usar room:leave", async () => {
