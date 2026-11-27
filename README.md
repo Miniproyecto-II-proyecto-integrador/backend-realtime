@@ -102,6 +102,8 @@ No agregar `.env` ni credenciales al repositorio o a la imagen Docker.
 
 ## Desarrollo y pruebas
 
+Usa Node.js 22 para reproducir la versión de la imagen Docker en local.
+
 ```bash
 npm install
 cp .env.example .env
@@ -115,6 +117,9 @@ Las pruebas usan dependencias simuladas y no escriben en Firestore real.
 `GET /health` devuelve `{"estado":"ok"}`.
 
 ## Docker y Render
+
+El Dockerfile usa Node.js 22 en las etapas de compilación y ejecución. La imagen
+final instala las dependencias de producción y arranca como usuario `node`.
 
 **US-07 requiere desplegar realtime antes de la API.** Confirma el commit nuevo en
 Render y la terminación de todas las instancias antiguas, incluidas las que
@@ -132,10 +137,9 @@ docker run --rm -p 3001:3001 \
   backend-realtime
 ```
 
-En Render, crear un servicio de tipo **Web Service** con runtime **Docker** y
-configurar la raíz del servicio como `backend-realtime` (o indicar
-`backend-realtime/Dockerfile` si la raíz es el repositorio). Configurar
-`FIREBASE_SERVICE_ACCOUNT_JSON` y `CORS_ORIGINS` en el panel de variables
-secretas; Render proporciona `PORT`. Usar `/health` como health check.
-Mantener una instancia mientras no se configure un adaptador distribuido para
-Socket.IO.
+En Render, crea un **Web Service** con runtime **Docker** conectado al
+repositorio independiente `backend-realtime`. Deja **Root Directory** en su
+valor predeterminado y usa `./Dockerfile` como **Dockerfile Path**. Configura
+`FIREBASE_SERVICE_ACCOUNT_JSON` y `CORS_ORIGINS` en el panel de variables de
+entorno. Render proporciona `PORT`. Usa `/health` como health check y mantén
+una sola instancia mientras la presencia y los eventos sean locales.
