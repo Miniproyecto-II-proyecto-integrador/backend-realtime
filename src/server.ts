@@ -1,5 +1,6 @@
-import { inicializarFirebaseAdmin, obtenerAuth } from "./config/firebase";
+import { inicializarFirebaseAdmin } from "./config/firebase";
 import { env } from "./config/env";
+import { verificarTokenFirebase } from "./middlewares/socketAuth";
 import { guardarMensaje } from "./repositories/messages.repository";
 import { observarSala, obtenerSala } from "./repositories/rooms.repository";
 import { crearServidorRealtime } from "./app";
@@ -8,10 +9,7 @@ inicializarFirebaseAdmin();
 
 const { httpServer } = crearServidorRealtime(
   {
-    verifyIdToken: async (token) => {
-      const { uid, name } = await obtenerAuth().verifyIdToken(token);
-      return { uid, name };
-    },
+    verifyIdToken: verificarTokenFirebase,
     getRoom: obtenerSala,
     watchRoom: observarSala,
     saveMessage: ({ roomId, ...mensaje }) => guardarMensaje(roomId, mensaje),

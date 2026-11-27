@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
 import { setTimeout as esperar } from "node:timers/promises";
+import firebaseApp = require("firebase-admin/app");
+import firebaseAuth = require("firebase-admin/auth");
 import {
   io as crearCliente,
   Socket as SocketCliente,
 } from "socket.io-client";
 import { crearServidorRealtime } from "../app";
+import { verificarTokenFirebase } from "../middlewares/socketAuth";
 import { PresenceTracker } from "../services/presence.service";
 import {
   ClientToServerEvents,
@@ -135,8 +138,12 @@ async function crearHarness(
 
 function diferir<T>() {
   let resolver!: (value: T) => void;
-  const promesa = new Promise<T>((resolve) => { resolver = resolve; });
-  return { promesa, resolver };
+  let rechazar!: (error: Error) => void;
+  const promesa = new Promise<T>((resolve, reject) => {
+    resolver = resolve;
+    rechazar = reject;
+  });
+  return { promesa, resolver, rechazar };
 }
 
 function salaEliminada(cliente: Cliente): Promise<{ roomId: string }> {
@@ -231,8 +238,8 @@ describe("servidor realtime", () => {
     assert.deepEqual(await avisos, [{ roomId: "room-a" }, { roomId: "room-a" }]);
     assert.equal(suscripciones[0].activa, false);
     assert.deepEqual(harness.app.presence.usuariosEnSala("room-a"), []);
-    assert.equal(harness.app.io.sockets.adapter.rooms.has("room-a"), false);
-    assert.ok(harness.app.io.sockets.sockets.get(aliceId)?.rooms.has("room-b"));
+    assert.equal(harness.app.io.sockets.adapter.rooms.has("study-room:room-a"), false);
+    assert.ok(harness.app.io.sockets.sockets.get(aliceId)?.rooms.has("study-room:room-b"));
     assert.ok(harness.app.io.sockets.sockets.get(bobId)?.connected);
 
     bob.disconnect();
@@ -259,7 +266,7 @@ describe("servidor realtime", () => {
     t.mock.method(adapter, "addAll", (id: string, rooms: Set<string>) => {
       // Introducir el socket en el canal antes de completar la admisión.
       addAll(id, rooms);
-      if (id === invitadoId && rooms.has("room-a")) {
+      if (id === invitadoId && rooms.has("study-room:room-a")) {
         ingresoEnCurso.resolver();
         return continuarIngreso.promesa;
       }
@@ -277,7 +284,7 @@ describe("servidor realtime", () => {
     assert.equal((await rechazo).code, "ROOM_NOT_FOUND");
     assert.deepEqual(await aviso, { roomId: "room-a" });
     assert.deepEqual(eventosInvitado, []);
-    assert.equal(adapter.rooms.has("room-a"), false);
+    assert.equal(adapter.rooms.has("study-room:room-a"), false);
     assert.deepEqual(harness.app.presence.usuariosEnSala("room-a"), []);
   });
 
@@ -351,6 +358,123 @@ describe("servidor realtime", () => {
     await ingresar(alice, "room-a");
     assert.deepEqual(confirmaciones, ["room-a"]);
     assert.equal(getRoom.mock.callCount(), 9);
+  });
+
+  it("retiene los ocho cupos hasta que Auth termina, aunque el ingreso venza", { timeout: 5_000 }, async (t) => {
+    const identidad = { uid: "uid-alice", name: "Alice" };
+    const verificaciones = Array.from({ length: 9 }, () => diferir<typeof identidad>());
+    const novenaIniciada = diferir<void>();
+    let siguiente = 0;
+    let retenerAuth = false;
+    const verifyIdToken = t.mock.fn(async () => {
+      if (!retenerAuth) return identidad;
+      const verificacion = verificaciones[siguiente++];
+      if (siguiente === 9) novenaIniciada.resolver();
+      return verificacion ? verificacion.promesa : identidad;
+    });
+    const getRoom = t.mock.fn(async (roomId: string) => salas.get(roomId) ?? null);
+    const harness = await crearHarness({ verifyIdToken, getRoom });
+    harnesses.add(harness);
+    const alice = harness.connect("alice");
+    await conectado(alice);
+    const socket = harness.app.io.sockets.sockets.get(alice.id!)!;
+    const emitir = t.mock.method(socket, "emit");
+    retenerAuth = true;
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+
+    const ids = Array.from({ length: 8 }, (_, i) => `auth-pendiente-${i}`);
+    for (const roomId of ids) alice.emit("room:join", { roomId });
+    const intentar = (roomId: string) => errorDeSala(alice, () => alice.emit("room:join", { roomId }));
+    assert.equal((await intentar("exceso")).code, "TOO_MANY_PENDING_JOINS");
+    assert.equal(verifyIdToken.mock.callCount(), 9); // Handshake y ocho admisiones.
+
+    const vencidos = diferir<void>();
+    const salasVencidas: string[] = [];
+    alice.on("room:error", ({ code, roomId }) => {
+      if (code !== "ROOM_JOIN_TIMEOUT") return;
+      assert.ok(roomId);
+      salasVencidas.push(roomId);
+      if (salasVencidas.length === 8) vencidos.resolver();
+    });
+    t.mock.timers.tick(4_999);
+    assert.equal(emitir.mock.callCount(), 1);
+    t.mock.timers.tick(1);
+    await vencidos.promesa;
+    assert.deepEqual(salasVencidas, ids);
+    assert.equal((await intentar("exceso")).code, "TOO_MANY_PENDING_JOINS");
+    assert.equal((await intentar(ids[0])).code, "TOO_MANY_PENDING_JOINS");
+    assert.equal(verifyIdToken.mock.callCount(), 9);
+
+    const respuestasAntesDeTerminarAuth = emitir.mock.callCount();
+    verificaciones[0].resolver(identidad);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(emitir.mock.callCount(), respuestasAntesDeTerminarAuth);
+    alice.emit("room:join", { roomId: ids[0] });
+    await novenaIniciada.promesa;
+    assert.equal((await intentar("exceso")).code, "TOO_MANY_PENDING_JOINS");
+    assert.equal(verifyIdToken.mock.callCount(), 10);
+
+    const respuestasAntesDelFallo = emitir.mock.callCount();
+    verificaciones[1].rechazar(Object.assign(new Error("Token revocado"), { code: "auth/id-token-revoked" }));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(emitir.mock.callCount(), respuestasAntesDelFallo);
+    assert.equal(getRoom.mock.callCount(), 0);
+    assert.equal(harness.suscripciones.size, 0);
+    assert.deepEqual([...socket.rooms], [socket.id]);
+    for (const roomId of ids) assert.equal(harness.app.presence.tieneUsuarios(roomId), false);
+
+    assert.equal((await ingresar(alice, "room-a")).roomId, "room-a");
+    assert.equal(getRoom.mock.callCount(), 1);
+    assert.equal(harness.suscripciones.size, 1);
+    assert.ok(socket.rooms.has("study-room:room-a"));
+
+    t.mock.timers.reset();
+    const desconectado = new Promise<void>((resolve) => socket.once("disconnect", () => resolve()));
+    alice.disconnect();
+    await desconectado;
+    for (const verificacion of verificaciones.slice(2)) verificacion.resolver(identidad);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(getRoom.mock.callCount(), 1);
+    assert.equal(harness.suscripciones.get("room-a")?.[0].activa, false);
+  });
+
+  it("cancela el ingreso al desconectar durante Auth sin emitir un resultado tardío", { timeout: 5_000 }, async (t) => {
+    const identidad = { uid: "uid-alice", name: "Alice" };
+    const authIniciada = diferir<void>();
+    const authPendiente = diferir<typeof identidad>();
+    let retenerAuth = false;
+    const getRoom = t.mock.fn(async (roomId: string) => salas.get(roomId) ?? null);
+    const harness = await crearHarness({
+      getRoom,
+      async verifyIdToken() {
+        if (!retenerAuth) return identidad;
+        authIniciada.resolver();
+        return authPendiente.promesa;
+      },
+    });
+    harnesses.add(harness);
+    const alice = harness.connect("alice");
+    await conectado(alice);
+    const socket = harness.app.io.sockets.sockets.get(alice.id!)!;
+    const emitir = t.mock.method(socket, "emit");
+    retenerAuth = true;
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+
+    alice.emit("room:join", { roomId: "room-a" });
+    await authIniciada.promesa;
+    const desconectado = new Promise<void>((resolve) => alice.once("disconnect", () => resolve()));
+    socket.disconnect();
+    t.mock.timers.tick(5_000);
+    t.mock.timers.reset();
+    await desconectado;
+    assert.equal(emitir.mock.callCount(), 0);
+    authPendiente.resolver(identidad);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(emitir.mock.callCount(), 0);
+    assert.equal(getRoom.mock.callCount(), 0);
+    assert.equal(harness.suscripciones.size, 0);
+    assert.equal(harness.app.presence.tieneUsuarios("room-a"), false);
+    assert.equal(socket.rooms.size, 0);
   });
 
   it("rechaza escrituras durante el cierre aunque el snapshot todavía no llegó", async () => {
@@ -438,9 +562,9 @@ describe("servidor realtime", () => {
     const terminarSalida = diferir<void>();
     const adapter = harness.app.io.sockets.adapter;
     const del = adapter.del.bind(adapter);
-    t.mock.method(adapter, "del", (id: string, roomId: string) => {
-      del(id, roomId);
-      if (roomId === "room-a") {
+    t.mock.method(adapter, "del", (id: string, canal: string) => {
+      del(id, canal);
+      if (canal === "study-room:room-a") {
         salidaEnCurso.resolver();
         return terminarSalida.promesa;
       }
@@ -504,26 +628,39 @@ describe("servidor realtime", () => {
     assert.equal(suscripciones[0].activa, false);
   });
 
-  it("acepta tokens válidos y rechaza conexiones sin token o con token inválido", async () => {
-    const harness = await nuevoHarness();
+  it("verifica vigencia con Firebase y distingue credenciales inválidas de una falla de Auth", async (t) => {
+    const appFicticia = { name: "demo-test" } as firebaseApp.App;
+    t.mock.getter(firebaseApp, "getApps", () => () => [appFicticia]);
+    t.mock.getter(firebaseApp, "getApp", () => () => appFicticia);
+    const verifyIdToken = t.mock.fn(async (token: string, vigente: boolean) => {
+      assert.equal(vigente, true);
+      if (token === "alice") return { uid: "uid-alice", name: "Alice" };
+      if (token === "certificados") {
+        throw Object.assign(new Error("Error fetching public keys for Google certs:"), {
+          code: "auth/argument-error",
+        });
+      }
+      throw Object.assign(new Error("Error de Auth simulado"), { code: token });
+    });
+    t.mock.method(firebaseAuth, "getAuth", () => ({ verifyIdToken }));
+    const harness = await crearHarness({ verifyIdToken: verificarTokenFirebase });
+    harnesses.add(harness);
 
-    const sinToken = harness.connect();
-    const errorSinToken = new Promise<Error>((resolve) =>
-      sinToken.once("connect_error", resolve),
-    );
-    assert.equal((await errorSinToken).message, "AUTH_REQUIRED");
-
-    const invalido = harness.connect("invalid");
-    const errorInvalido = new Promise<Error>((resolve) =>
-      invalido.once("connect_error", resolve),
-    );
-    assert.equal((await errorInvalido).message, "INVALID_TOKEN");
-
-    const expirado = harness.connect("expired");
-    const errorExpirado = new Promise<Error>((resolve) =>
-      expirado.once("connect_error", resolve),
-    );
-    assert.equal((await errorExpirado).message, "INVALID_TOKEN");
+    for (const [token, esperado] of [
+      [undefined, "AUTH_REQUIRED"],
+      ["auth/invalid-argument", "INVALID_TOKEN"],
+      ["auth/id-token-expired", "INVALID_TOKEN"],
+      ["auth/id-token-revoked", "INVALID_TOKEN"],
+      ["auth/user-disabled", "INVALID_TOKEN"],
+      ["auth/user-not-found", "INVALID_TOKEN"],
+      ["certificados", "AUTH_UNAVAILABLE"],
+      ["auth/internal-error", "AUTH_UNAVAILABLE"],
+    ]) {
+      const cliente = harness.connect(token);
+      const error = await new Promise<Error>((resolve) => cliente.once("connect_error", resolve));
+      assert.equal(error.message, esperado);
+    }
+    assert.equal(verifyIdToken.mock.callCount(), 7);
 
     const valido = harness.connect("alice");
     await conectado(valido);
@@ -535,16 +672,84 @@ describe("servidor realtime", () => {
     const cliente = harness.connect("guest");
     await conectado(cliente);
 
-    const sala = await ingresar(cliente, "room-a");
+    const sala = await ingresar(cliente, "  room-a  ");
+    assert.equal(sala.roomId, "room-a");
     assert.equal(sala.roomName, "Sala A");
     assert.deepEqual(sala.onlineUsers, [
       { uid: "uid-guest", displayName: "Guest" },
     ]);
+    assert.deepEqual(await ingresar(cliente, "room-a"), sala);
+    assert.equal(harness.suscripciones.get("room-a")?.length, 1);
 
     const error = await errorDeSala(cliente, () =>
       cliente.emit("room:join", { roomId: "missing-room" }),
     );
     assert.equal(error.code, "ROOM_NOT_FOUND");
+  });
+
+  it("revalida la sesión de un socket conectado antes de consultar o admitirlo en otra sala", async (t) => {
+    let fallo: string | undefined;
+    const getRoom = t.mock.fn(async (roomId: string) => salas.get(roomId) ?? null);
+    const harness = await crearHarness({
+      getRoom,
+      async verifyIdToken() {
+        if (fallo) throw Object.assign(new Error("Fallo de Auth simulado"), { code: fallo });
+        return { uid: "uid-guest", name: "Guest" };
+      },
+    });
+    harnesses.add(harness);
+    const cliente = harness.connect("guest");
+    await conectado(cliente);
+    await ingresar(cliente, "room-a");
+
+    for (const [codigo, esperado] of [
+      ["auth/user-not-found", "INVALID_TOKEN"],
+      ["auth/id-token-revoked", "INVALID_TOKEN"],
+      ["auth/id-token-expired", "INVALID_TOKEN"],
+      ["auth/user-disabled", "INVALID_TOKEN"],
+      ["auth/internal-error", "AUTH_UNAVAILABLE"],
+    ]) {
+      fallo = codigo;
+      const error = await errorDeSala(cliente, () => cliente.emit("room:join", { roomId: "room-b" }));
+      assert.equal(error.code, esperado);
+      assert.equal(error.roomId, "room-b");
+    }
+    assert.equal(getRoom.mock.callCount(), 1);
+    assert.equal(harness.suscripciones.has("room-b"), false);
+    assert.deepEqual(harness.app.presence.usuariosEnSala("room-b"), []);
+
+    fallo = undefined;
+    assert.equal((await ingresar(cliente, "room-b")).roomId, "room-b");
+  });
+
+  it("rechaza IDs inválidos antes de abrir suscripciones o consultar Firestore", async (t) => {
+    const getRoom = t.mock.fn(async () => null);
+    const harness = await crearHarness({ getRoom });
+    harnesses.add(harness);
+    const cliente = harness.connect("guest");
+    await conectado(cliente);
+
+    for (const roomId of ["", "  ", 42 as unknown as string, "a/b", ".", "..", "__reserved__",
+      "a\u0000b", "a\nb", "a\u007fb", "a".repeat(129)]) {
+      const error = await errorDeSala(cliente, () => cliente.emit("room:join", { roomId }));
+      assert.equal(error.code, "INVALID_ROOM_ID");
+      assert.equal(error.roomId, undefined);
+    }
+    assert.equal(getRoom.mock.callCount(), 0);
+    assert.equal(harness.suscripciones.size, 0);
+  });
+
+  it("un ingreso rechazado conserva el canal privado aunque coincida con el ID solicitado", async () => {
+    const harness = await nuevoHarness();
+    const cliente = harness.connect("guest");
+    await conectado(cliente);
+    const idPropio = cliente.id!;
+    const { rooms } = harness.app.io.sockets.adapter;
+    assert.ok(rooms.get(idPropio)?.has(idPropio));
+
+    const error = await errorDeSala(cliente, () => cliente.emit("room:join", { roomId: idPropio }));
+    assert.equal(error.code, "ROOM_NOT_FOUND");
+    assert.ok(rooms.get(idPropio)?.has(idPropio));
   });
 
   it("rechaza mensajes de sockets fuera de la sala y contenido inválido", async () => {
